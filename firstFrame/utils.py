@@ -107,12 +107,10 @@ def unzip_objs(objs):
 
     return tlwhs, ids, scores
 
-def plotTracking(image,tlwhs):
-    im = np.copy(image)
-    color = (0,0,255)
-    line_thickness = 2
-    for tlwh in tlwhs:
-        x1,y1,w,h = tlwh
-        intbox = tuple(map(int,(x1,y1,x1+w,y1+h)))
-        cv2.rectangle(im,intbox[0:2],intbox[2:4],color=color,thickness=line_thickness)
-    return im
+def getGrad(xIm,yIm,tlbr):
+    x1,y1,x2,y2 = [int(i) for i in tlbr ]
+    XTGrad = yIm[y1,x1:x2+1].sum()
+    YTGrad = xIm[y1:y2+1,x1].sum()
+    XBGrad = yIm[y2,x1:x2+1].sum()
+    YBGrad = xIm[y1:y2+1,x2].sum()
+    return XTGrad+YTGrad,XBGrad+YBGrad
