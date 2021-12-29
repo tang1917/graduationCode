@@ -1,6 +1,5 @@
 import numpy as np
-from utils import read_mot_results,unzip_objs,getGrad
-import copy
+from utils import read_mot_results,unzip_objs,getGrad,get_color
 import cv2
 
     
@@ -9,6 +8,7 @@ class baseBox:
         self.tlbr = tlbr
         self.overlay = []
         self.belong = []
+        self.boxColor = None
 class motBoxs:
     def __init__(self) -> None:
         pass
@@ -57,21 +57,18 @@ class motBoxs:
         return boxs
     def displayInter(self,img,boxs):
         im = np.copy(img)
-        interColor = (0,255,0)
-        interThickness = 2
-        boxColor = (0,0,255)
         boxThickness = 2
-        for box in boxs:
+        for ind,box in enumerate(boxs):
+            boxColor = get_color(ind)
+            box.boxColor = boxColor
+            x1,y1,x2,y2 = box.tlbr
+            intbox = tuple(map(int,(x1,y1,x2,y2)))
+            #cv2.rectangle(im,intbox[0:2],intbox[2:4],color=boxColor,thickness=boxThickness)
             for i,tlbr in enumerate(box.overlay):
                 if box.belong[i]:
                     x1,y1,x2,y2 = tlbr
                     intbox = tuple(map(int,(x1,y1,x2,y2)))
-                    cv2.rectangle(im,intbox[0:2],intbox[2:4],color=interColor,thickness=interThickness)
-            '''
-            x1,y1,x2,y2 = box.tlbr
-            intbox = tuple(map(int,(x1,y1,x2,y2)))
-            cv2.rectangle(im,intbox[0:2],intbox[2:4],color=boxColor,thickness=boxThickness)
-            '''
+                    cv2.rectangle(im,intbox[0:2],intbox[2:4],color=box.boxColor,thickness=boxThickness)
         return im
     def to_tlbrs(self,tlwhs):
         ret = tlwhs.copy()
@@ -114,14 +111,14 @@ if __name__=='__main__':
     is_ignore = False
     is_gt = False
     dets = read_mot_results(filename,is_gt,is_ignore)
-    first_dets = dets.get(1,[])
-    #tlwhs,_,scores = unzip_objs(first_dets)
+    first_dets = dets.get(20,[])
+    tlwhs,_,scores = unzip_objs(first_dets)
     boxs = motBoxs()
     img = cv2.imread(img_root)
-    tlwhs = np.asarray([[614,430,92,289],[678,448,77,227]])
+    #tlwhs = np.asarray([[614,430,92,289],[678,448,77,227]])
     bs = boxs.update(tlwhs,img)
     im = boxs.displayInter(img,bs)
-    cv2.imwrite(r'D:\report\materials\12_28\finish_.jpg',im)
+    cv2.imwrite(r'D:\report\materials\12_28\20.jpg',im)
     cv2.namedWindow('img',0)
     cv2.imshow('img',im)
     cv2.waitKey(0)

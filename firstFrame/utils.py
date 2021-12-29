@@ -114,3 +114,9 @@ def getGrad(xIm,yIm,tlbr):
     XBGrad = yIm[y2,x1:x2+1].sum()
     YBGrad = xIm[y1:y2+1,x2].sum()
     return XTGrad+YTGrad,XBGrad+YBGrad
+    
+def get_color(idx):
+    idx = idx * 3
+    color = ((37 * idx) % 255, (17 * idx) % 255, (29 * idx) % 255)
+
+    return color
