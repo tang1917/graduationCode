@@ -77,14 +77,15 @@ class ParticleFilter(object):
         pn.sp = p.s 
         pn.x0 = p.x0
         pn.y0 = p.y0
-        pn.width = p.width
-        pn.height = p.height
+        pn.width = p.width*pn.s
+        pn.height = p.height*pn.s
         pn.w = 0
         return pn
     def transition(self,particles,w,h):
         for i in range(self.numParticles):
             particles[i] = self.calTransition(particles[i],w,h)
         return particles
+    '''
     def fun(self,x,y,tlwh,p):
         #sum = 0.0
         retT = np.asarray(tlwh,dtype=float).copy()
@@ -103,20 +104,18 @@ class ParticleFilter(object):
         if valP>valT:
             return valT
         return valP
+    '''
     def compute(self,tlwh,p):
-
-        start = time.clock()
         x = p.x
         y = p.y
-        xLeft = x-(p.width/2)
-        xRight = x+(p.width/2)
-        yLow = y-(p.height/2)
-        yUp = y+(p.height/2)
-        #v,err = integrate.dblquad(f1,float("-inf"),float("inf"),float("-inf"),float("inf"),args=(tlwh,p))
-        v, err = integrate.dblquad(
-            self.fun, yLow, yUp, xLeft,xRight, args=(tlwh, p))
-        print('time:',time.clock()-start)
-        return v
+        retT = np.asarray(tlwh,dtype=float).copy()
+        retT[:2] += retT[2:]/2
+        u1,u2 = retT[:2]
+        stdXT = retT[2]/(2*SIGMA)
+        stdYT = retT[3]/(3*SIGMA)
+        n = -0.5*(math.pow((x-u1),2)/math.pow(stdXT,2)+math.pow(y-u2,2)/math.pow(stdYT,2))
+        valT =math.exp(n)/(2*np.pi*stdXT*stdYT)
+        return valT
     def updateweight(self,particles,tlwh):
         sum = 0.0
         for i in range(self.numParticles):
@@ -132,28 +131,12 @@ class ParticleFilter(object):
         n = self.numParticles
         k = 0
         particles = sorted(particles,key = lambda x:x.w,reverse=True)
-        #print('****')
-        #for i in range(5):
-            #print(i)
-            #print(self.particles[i].w)
-            #print(self.particles[i].x,self.particles[i].y)
-        #print('****')
         new_particles = copy.deepcopy(particles)
         width= particles[0].width
         height = particles[0].height
-        s = particles[0].s
-        sp = particles[0].s
         for i in range(n):
             np = round(particles[i].w*n)
-            for j in range(np):
-                new_particles[k] = particles[i]
-                new_particles[k].width = width
-                new_particles[k].height = height
-                new_particles[k].s = s
-                new_particles[k].sp = sp
-                k = k+1
-                if(k==n):
-                    break
+            k = k+1
             if(k==n):
                 break
         while k<n:
@@ -163,12 +146,13 @@ class ParticleFilter(object):
     def update(self,particles,tlwh):
         particles = self.updateweight(particles,tlwh)
         particles = self.resample(particles)
-        x = particles[0].x
-        y = particles[0].y
-        a = particles[0].width/particles[0].height
-        h = particles[0].height
-        mean = np.asarray([x,y,a,h],dtype=float)
-        return mean,particles
+        ret = np.asarray(tlwh).copy()
+        ret[:2] += ret[2:] / 2
+        ret[2] /= ret[3]
+        for p in particles:
+            p.width = tlwh[2]
+            p.height = tlwh[3]
+        return ret,particles
         
     def displayParticle(self,img,p,color):
         x0 = max(0,round(p.x-0.5*p.width))
