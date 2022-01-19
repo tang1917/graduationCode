@@ -2,4 +2,4 @@
 /MOTDT/data
 /MOTDT/squeezenet_small40_coco_mot16_ckpt_10.h5
 /MOTDT/googlenet_part8_all_xavier_ckpt_56.h5
-
+/classificationModel/data

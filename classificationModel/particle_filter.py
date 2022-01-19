@@ -1,18 +1,23 @@
+from hashlib import new
 from warnings import filters
 import numpy as np
 import math
 import copy
 import cv2
+from numpy.lib.function_base import append
+from scipy.spatial.distance import cdist
 from torch.utils.data import dataloader
 from scipy import integrate
 import time
 from datasets.mot_seq import get_loader
 from models.classification.classifier import PatchClassifier
+from models.reid import load_reid_model, extract_reid_features
+
+
 TRANS_X_STD = 0.5
 TRANS_Y_STD = 1.0
 #TRANS_S_STD = 0.001
 TRANS_S_STD = 0.01
-MAX_PARTICLES = 50
 SHOW_ALL = 0
 SHOW_SELECTED = 1
 
@@ -20,10 +25,6 @@ A1 = 2.0
 A2 = -1.0
 B0 = 1.0000
 
-
-#STD_Y = 10
-#STD_X = 10
-SIGMA = 3
 
 
 class Particle(object):
@@ -77,11 +78,7 @@ class ParticleFilter(object):
         pn.x = max(0.0, min(w-1.0, x))
         pn.y = max(0.0, min(h-1.0, y))
 
-        pn.s = max(0.9*p.s, min(s, 1.1*p.s))
-        if pn.s < 0.95:
-            pn.s = 0.95
-        elif pn.s > 1.15:
-            pn.s = 1.15
+        pn.s = max(0.95*p.s, min(s, 1.05*p.s))
         #pn.s = 1.0
         pn.xp = p.x
         pn.yp = p.y
@@ -100,7 +97,7 @@ class ParticleFilter(object):
     '''
     打分模型计算粒子权重
     '''
-    def updateweight(self, particles, classifier):
+    def updateweight(self, particles, classifier,reid_model,feature,image,min_score=0.6):
         tlbrs = []
         for p in particles:
             x = p.x
@@ -112,39 +109,64 @@ class ParticleFilter(object):
             tlbrs.append([x, y, x+width, y+height])
         tlbrs = np.asarray(tlbrs)
         scores = classifier.predict(tlbrs)
+
+        #只保留分数较高的粒子
+        index = np.where(scores>min_score)[0]
+        count = len(index)
+        # 标记为跟踪丢失
+        if count<=2:
+            return False, particles
+
+        particles = [particles[i] for i in index]
+        tlbrs  = [tlbrs[i] for i in index]
+        
+
+        pFeatures = extract_reid_features(reid_model, image, tlbrs)
+        pFeatures = pFeatures.cpu().numpy()
+        #feature = feature[np.newaxis,:]
+        #根据特征相似性确定粒子权重
+        scores = 1/cdist(feature,pFeatures,metric="cosine")
+        scores = scores[0]
+        #print(scores)
         #print('scores=',scores)
         for i, p in enumerate(particles):
             p.w = scores[i]
         total = scores.sum()
-        print('total=', total)
-        for i in range(self.numParticles):
+        #print('total=', total)
+        for i in range(count):
             particles[i].w = float(particles[i].w/total)
-        return particles
+        return True,particles
 
     def resample(self, particles):
         n = self.numParticles
         k = 0
-        #print('sorted', len(particles))
         particles = sorted(particles, key=lambda x: x.w, reverse=True)
+        particles_num = len(particles)
+
         new_particles = copy.deepcopy(particles)
-        width = particles[0].width
-        height = particles[0].height
-        for i in range(n):
-            np = round(particles[i].w*n)
+        for i in range(particles_num):
+            np = round(particles[i].w*particles_num)
+            #print('np=',np)
             for j in range(np):
                 new_particles[k] = particles[i]
                 k = k+1
-                if k == n:
+                if k == particles_num:
                     break
-            if(k == n):
+            if(k == particles_num):
                 break
-        while k < n:
+        
+        while k < particles_num:
+      
             new_particles[k] = particles[0]
             k = k+1
+        num = n-particles_num
+        for i in range(num):
+            new_particles.append(particles[0])
         return new_particles
 
-    def update(self, particles, classfier):
-        particles = self.updateweight(particles, classfier)
+    def update(self, particles, classfier,reid_model,feature,image):
+        co,particles = self.updateweight(particles, classfier,reid_model,feature,image)
+        assert co
         particles = self.resample(particles)
         return particles
 
@@ -175,39 +197,44 @@ class ParticleFilter(object):
 
 if __name__ == '__main__':
     classifier = PatchClassifier()
+    reid_model = load_reid_model()
+    tlbrs = []
+    measurement = np.asarray([455,433,550,728],dtype=np.float32)
+    tlbrs.append(measurement)
+    img_root = r'/home/xd/Pictures/000001.jpg'
+    img = cv2.imread(img_root)
+    #classifier.update(img)
+    feature = extract_reid_features(reid_model,img,tlbrs)
+    feature = feature.cpu().numpy()
+    print(feature.shape)
     data_root = '/home/xd/graduate/MOTDT/data/MOT16/train'
     det_root = None
     seq = 'MOT16-02'
     loader = get_loader(data_root, det_root, seq)
     pFilter = ParticleFilter()
-    measurement = [[455,433,550,728],[542,442,589,577],[573,402,675,717],[652,454,713,650],[723,447,765,575],[1019,424,1058,546],[1098,433,1130,554],
-    [1254,447,1288,549],[1361,412,1478,774],[1478,415,1598,775]]
-    #measurement = [[455,433,550,728]]
-    measurement = np.asarray(measurement, dtype=float)
     for frame_id, batch in enumerate(loader):
-        print('***********',frame_id,'***************')
-        frame, det_tlwhs, det_scores, _, _ = batch
-        img = frame.copy()
-        h, w, _ = frame.shape
-        classifier.update(frame)
-        if frame_id == 0:
-            filters= []
-            for tlbr in measurement:         
-                particles = pFilter.initiate(tlbr)
-                filters.append(particles)
-            #particles = pFilter.initiate(measurement)
-            # print(len(particles))
-            #particles = pFilter.update(particles, classifier)
-        else:
-            size = len(filters)
-            for i in range(size):
-                filters[i] = pFilter.transition(filters[i],w,h)
-                filters[i] = pFilter.update(filters[i], classifier)
-            #for particles in filters:
-                #particles = pFilter.transition(particles, w, h)
-                #particles = pFilter.update(particles, classifier)
-        # print('...',particles[0])
+            #print('***********',frame_id,'***************')
+            frame, det_tlwhs, det_scores, _, _ = batch
+            img = frame.copy()
+            h, w, _ = frame.shape
+            classifier.update(frame)
+            if frame_id == 0:    
+                particles = pFilter.initiate(measurement)
+            else:
+                particles = pFilter.transition(particles,w,h)
+                particles = pFilter.update(particles, classifier,reid_model,feature,frame)
                 pFilter.displayParticles(
-                    img, filters[i], (0, 0, 255), (0, 255, 0), SHOW_SELECTED)
-        cv2.imshow('img', img)
-        cv2.waitKey(1)
+                    img, particles, (0, 0, 255), (0, 255, 0), SHOW_SELECTED)
+            cv2.imshow('img', img)
+            cv2.waitKey(1)
+
+
+    '''
+
+    #measurement = [[455,433,550,728],[542,442,589,577],[573,402,675,717],[652,454,713,650],[723,447,765,575],[1019,424,1058,546],[1098,433,1130,554],
+    #[1254,447,1288,549],[1361,412,1478,774],[1478,415,1598,775]]
+    #measurement = [[455,433,550,728]]
+    
+    measurement = np.asarray(measurement, dtype=float)
+    
+    '''

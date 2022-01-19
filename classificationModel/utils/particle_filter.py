@@ -7,11 +7,13 @@ from scipy import integrate
 import time
 from datasets.mot_seq import get_loader
 from models.classification.classifier import PatchClassifier
+from models.reid import load_reid_model, extract_reid_features
+from scipy.spatial.distance import cdist
+
 TRANS_X_STD = 0.5
 TRANS_Y_STD = 1.0
 #TRANS_S_STD = 0.001
 TRANS_S_STD = 0.01
-MAX_PARTICLES = 50
 SHOW_ALL = 0
 SHOW_SELECTED = 1
 
@@ -19,10 +21,6 @@ A1 = 2.0
 A2 = -1.0
 B0 = 1.0000
 
-
-#STD_Y = 10
-#STD_X = 10
-SIGMA = 3
 
 
 class Particle(object):
@@ -50,17 +48,18 @@ class ParticleFilter(object):
         particles = []
         # print('measurement=',measurement)
         ret = copy.deepcopy(measurement)
-        ret[:2] += ret[2:]/2
+        ret[:2] = ret[:2]+ret[2:]/2
         x_ = ret[0]
         y_ = ret[1]
         width = ret[2]
         height = ret[3]
+
+        #a = width/height
         #mean = np.asarray([x_,y_,a,height],dtype=float)
         particle = Particle(x_, y_, 1.0, x_, y_, 1.0, x_, y_, width, height)
         for i in range(self.numParticles):
             particles.append(particle)
         # print('mean=',mean)
-        #tlwh = np.asarray([x_,y_,width,height],dtype = float)
         return particles
 
     def calTransition(self, p, w, h):
@@ -71,15 +70,12 @@ class ParticleFilter(object):
             np.random.normal(0, TRANS_Y_STD) + p.y0
         s = p.s +np.random.normal(0, TRANS_S_STD)
         #s = A1*(p.s-1.0) + A2*(p.sp-1.0)+B0*np.random.normal(0, TRANS_S_STD)+1.0
-        #print('s=',s)
         pn.x = max(0.0, min(w-1.0, x))
         pn.y = max(0.0, min(h-1.0, y))
 
         pn.s = max(0.9*p.s, min(s, 1.1*p.s))
-        if pn.s < 0.9:
-            pn.s = 0.9
-        elif pn.s > 1.1:
-            pn.s = 1.1
+    
+        #pn.s = 1.0
         pn.xp = p.x
         pn.yp = p.y
         pn.sp = p.s
@@ -97,7 +93,7 @@ class ParticleFilter(object):
     '''
     打分模型计算粒子权重
     '''
-    def updateweight(self, particles, classifier):
+    def updateweight(self, particles, classifier,reid_model,feature,image,min_score):
         tlbrs = []
         for p in particles:
             x = p.x
@@ -109,38 +105,58 @@ class ParticleFilter(object):
             tlbrs.append([x, y, x+width, y+height])
         tlbrs = np.asarray(tlbrs)
         scores = classifier.predict(tlbrs)
-        #print(scores)
+        #只保留分数较高的粒子
+        index = np.where(scores>min_score)[0]
+        count = len(index)
+        # 标记为跟踪丢失
+        if count==0:
+            return False, particles
+        particles = [particles[i] for i in index]
+        tlbrs  = [tlbrs[i] for i in index]
+        #print('tlbrs=',tlbrs)
+        pFeatures = extract_reid_features(reid_model, image, tlbrs)
+        pFeatures = pFeatures.cpu().numpy()
+        feature = feature[np.newaxis,:]
+        #根据特征相似性确定粒子权重
+        scores = 1/cdist(feature,pFeatures,metric="cosine")
+        scores = scores[0]
         for i, p in enumerate(particles):
             p.w = scores[i]
         total = scores.sum()
         #print('total=', total)
-        for i in range(self.numParticles):
+        for i in range(count):
             particles[i].w = float(particles[i].w/total)
-        return particles
+        return True,particles
 
     def resample(self, particles):
         n = self.numParticles
         k = 0
-        #print('sorted', len(particles))
         particles = sorted(particles, key=lambda x: x.w, reverse=True)
+        particles_num = len(particles)
+
         new_particles = copy.deepcopy(particles)
-        width = particles[0].width
-        height = particles[0].height
-        for i in range(n):
-            np = round(particles[i].w*n)
+        for i in range(particles_num):
+            np = round(particles[i].w*particles_num)
+            #print('np=',np)
             for j in range(np):
                 new_particles[k] = particles[i]
                 k = k+1
-                if k == n:
+                if k == particles_num:
                     break
-            if(k == n):
+            if(k == particles_num):
                 break
-        while k < n:
+        
+        while k < particles_num:
             new_particles[k] = particles[0]
             k = k+1
+
+        num = n-particles_num
+        for i in range(num):
+            new_particles.append(particles[0])
         return new_particles
 
-    def update(self, particles, classfier):
-        particles = self.updateweight(particles, classfier)
-        particles = self.resample(particles)
+    def update(self, particles, classfier,reid_model,feature,image):
+        co,particles = self.updateweight(particles, classfier,reid_model,feature,image)
+        if co:
+            particles = self.resample(particles)
         return particles

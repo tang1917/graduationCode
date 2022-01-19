@@ -110,3 +110,17 @@ def unzip_objs(objs):
     tlwhs = np.asarray(tlwhs, dtype=float).reshape(-1, 4)
 
     return tlwhs, ids, scores
+
+def getGrad(xIm,yIm,tlbr):
+    x1,y1,x2,y2 = [int(i) for i in tlbr ]
+    XTGrad = yIm[y1,x1:x2+1].sum()
+    YTGrad = xIm[y1:y2+1,x1].sum()
+    XBGrad = yIm[y2,x1:x2+1].sum()
+    YBGrad = xIm[y1:y2+1,x2].sum()
+    return XTGrad+YTGrad,XBGrad+YBGrad
+
+def get_color(idx):
+    idx = idx * 3
+    color = ((37 * idx) % 255, (17 * idx) % 255, (29 * idx) % 255)
+
+    return color

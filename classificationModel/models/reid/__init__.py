@@ -34,6 +34,11 @@ def extract_image_patches(image, bboxes):
     bboxes = np.round(bboxes).astype(np.int)
     bboxes = bbox_utils.clip_boxes(bboxes, image.shape)
     patches = [image[box[1]:box[3], box[0]:box[2]] for box in bboxes]
+    for i,p in enumerate(patches):
+        w,h,_ = p.shape
+        if(w==0) or (h==0):
+            print('bbox=',bboxes[i])
+            cv2.imwrite(r'/home/xd/Pictures/problem_1.jpg',image)
     return patches
 
 

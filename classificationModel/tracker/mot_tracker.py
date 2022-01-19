@@ -1,10 +1,15 @@
+from turtle import update
+from numba.cuda.simulator.api import detect
 import numpy as np
 from numba import jit
 from collections import OrderedDict, deque
 import itertools
+import cv2
+from numpy.lib.type_check import imag
 
 from utils.nms_wrapper import nms_detections
 from utils.log import logger
+from utils.overlap import cutOverLap
 
 from tracker import matching
 #from utils.kalman_filter import KalmanFilter
@@ -22,24 +27,25 @@ class STrack(BaseTrack):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float)
-        #self.kalman_filter = None
+
+        self.min_score = 0.3
         self.particle_filter = None
-        #self.mean, self.covariance = None, None
         self.mean = None
         self.particles = None
         self.is_activated = False
 
         self.tlwhs = None
-        self.score = None
+        
         self.max_n_features = max_n_features
         self.curr_feature = None
         self.last_feature = None
         self.features = deque([], maxlen=self.max_n_features)
-
+        self.tracklet_len = 0
+        self.time_by_tracking = 0
         # classification
         self.overlay = []
         self.belong = []
-    
+
     def set_feature(self, feature):
         if feature is None:
             return False
@@ -49,28 +55,31 @@ class STrack(BaseTrack):
         # self._p_feature = 0
         return True
 
-    #def activate(self, kalman_filter, frame_id, image):
-    def activate(self,particle_filter,frame_id,image):
+    def predict(self, w, h):
+        self.particles = self.particle_filter.transition(self.particles, w, h)
+
+    # def activate(self, kalman_filter, frame_id, image):
+    def activate(self, particle_filter, frame_id):
         """Start a new tracklet"""
         self.particle_filter = particle_filter
         self.track_id = self.next_id()
-        self.particles =self.particle_filter.initiate(self._tlwh)
-        self.mean = self._tlwh.copy()
+        self.particles = self.particle_filter.initiate(self._tlwh)
+        self.mean = self.tlwh_to_xyah(self._tlwh)
         del self._tlwh
         self.state = TrackState.Tracked
         # self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
 
-    def re_activate(self, new_track, frame_id, image, new_id=False):
+    def re_activate(self, new_track, frame_id, new_id=False):
         # self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xyah(new_track.tlwh))
-        #self.mean, self.covariance = self.kalman_filter.update(
+        # self.mean, self.covariance = self.kalman_filter.update(
         #   self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh)
         # )
 
-
-        #粒子更新
-        self.mean,self.particles = self.particle_filter.update(self.particles,new_track.tlwh)
+        # 重新初始化粒子
+        self.particles = self.particle_filter.initiate(new_track._tlwh)
+        self.mean = self.tlwh_to_xyah(new_track._tlwh)
         self.time_since_update = 0
         self.time_by_tracking = 0
         self.tracklet_len = 0
@@ -79,10 +88,9 @@ class STrack(BaseTrack):
         self.frame_id = frame_id
         if new_id:
             self.track_id = self.next_id()
+        # self.set_feature(new_track.curr_feature)
 
-        self.set_feature(new_track.curr_feature)
-
-    def update(self, classfier,frame_id, image, update_feature=True):
+    def update(self, classfier, frame_id, image, reid_model):
         """
         Update a matched track
         :type new_track: STrack
@@ -94,20 +102,24 @@ class STrack(BaseTrack):
         self.time_since_update = 0
         self.tracklet_len += 1
 
-        #new_tlwh = new_track.tlwh
-        #self.mean, self.covariance = self.kalman_filter.update(
-            #self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh))
-        self.mean,self.particles = self.particle_filter.update(self.particles,classfier)
+        #更新粒子权重
+        flag,self.particles = self.particle_filter.updateweight(
+            self.particles, classfier, reid_model, self.curr_feature, image, self.min_score)
 
-        self.state = TrackState.Tracked
-        self.is_activated = True
+        if flag:
+            self.state = TrackState.Tracked
+            self.particles = self.particle_filter.resample(self.particles)
+            self.is_activated = True
+        else:
+            self.state = TrackState.Lost
+            self.is_activated = False
 
-        #self.score = new_track.score
-
-        #if update_feature:
-            #self.set_feature(new_track.curr_feature)
-            #if self.tracker:
-                #self.tracker.update(image, self.tlwh)
+        x = self.particles[0].x
+        y = self.particles[0].y
+        width = self.particles[0].width
+        height = self.particles[0].height
+        a = width/height
+        self.mean = np.asarray([x,y,a,height] ,dtype = float)
 
     @property
     @jit
@@ -117,7 +129,7 @@ class STrack(BaseTrack):
         """
         if self.mean is None:
             return self._tlwh.copy()
-        ret = self.mean[:4].copy()
+        ret = self.mean.copy()
         ret[2] *= ret[3]
         ret[:2] -= ret[2:] / 2
         return ret
@@ -128,7 +140,7 @@ class STrack(BaseTrack):
         """Convert bounding box to format `(min x, min y, max x, max y)`, i.e.,
         `(top left, bottom right)`.
         """
-        #print('ret=',)
+        # print('ret=',)
         ret = self.tlwh.copy()
         ret[2:] += ret[:2]
         return ret
@@ -144,13 +156,17 @@ class STrack(BaseTrack):
         ret[2] /= ret[3]
         return ret
 
+    def tracklet_score(self):
+        # score = (1 - np.exp(-0.6 * self.hit_streak)) * np.exp(-0.03 * self.time_by_tracking)
+        score = self.particles[0].w+1
+        return score
     def to_xyah(self):
         return self.tlwh_to_xyah(self.tlwh)
 
     def __repr__(self):
         return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame, self.end_frame)
 
-'''
+
 class OnlineTracker(object):
 
     def __init__(self, min_cls_score=0.4, min_ap_dist=0.64, max_time_lost=30, use_tracking=True, use_refind=True):
@@ -172,157 +188,156 @@ class OnlineTracker(object):
         self.reid_model = load_reid_model()
 
         self.frame_id = 0
-
-    def update(self, image, tlwhs, det_scores=None):
+    def update(self, image, tlwhs, det_scores):
         self.frame_id += 1
-        #print(self.frame_id)
         activated_starcks = []
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
-        h,w,_ = image.shape
+        h, w, _ = image.shape
+        self.classifier.update(image)
+
+        nms_tlbrs = []
+        scores = []
+        index = []
         """step 1: prediction"""
-        for strack in itertools.chain(self.tracked_stracks, self.lost_stracks):
-            strack.predict(w,h)
-        """step 2: scoring and selection"""
-        if det_scores is None:
-            det_scores = np.ones(len(tlwhs), dtype=float)
-        detections = [STrack(tlwh, score, from_det=True) for tlwh, score in zip(tlwhs, det_scores)]
-        #print('243=',len(self.tracked_stracks))
-        if self.classifier is None:
-            pred_dets = []
-        else:
-            self.classifier.update(image)
-            n_dets = len(tlwhs)
-            if self.use_tracking:
-                tracks = []
-                for t in itertools.chain(self.tracked_stracks, self.lost_stracks):
-                    if t.is_activated:
-                        #print('t.is_activated')
-                        for tlwh in t.self_tracking(image):
-                            tracks.append(STrack(tlwh,t.tracklet_score(),from_det=False))
-
-                #tracks = [STrack(tlwh, t.tracklet_score(), from_det=False)
-                        #for t in itertools.chain(self.tracked_stracks, self.lost_stracks) if t.is_activated for tlwh in t.self_tracking(image)]
-                #print('***********259',len(tracks))
-                detections.extend(tracks)
-                #print('************242',detections[0]._tlwh)
-            rois = np.asarray([d.tlbr for d in detections], dtype=np.float32)
-
-            cls_scores = self.classifier.predict(rois)
-            scores = np.asarray([d.score for d in detections], dtype=np.float)
-            scores[0:n_dets] = 1.
-            scores = scores * cls_scores
-            # nms
-            if len(detections) > 0:
-                keep = nms_detections(rois, scores.reshape(-1), nms_thresh=0.3)
-                mask = np.zeros(len(rois), dtype=np.bool)
-                mask[keep] = True
-                keep = np.where(mask & (scores >= self.min_cls_score))[0]
-                detections = [detections[i] for i in keep]
-                scores = scores[keep]
-                for d, score in zip(detections, scores):
-                    d.score = score
-            pred_dets = [d for d in detections if not d.from_det]
-            detections = [d for d in detections if d.from_det]
-
-        # set features
-        tlbrs = [det.tlbr for det in detections]
-        features = extract_reid_features(self.reid_model, image, tlbrs)
-        features = features.cpu().numpy()
-        for i, det in enumerate(detections):
-            det.set_feature(features[i])
-
-        """step 3: association for tracked"""
-        # matching for tracked targets
-        unconfirmed = []
-        tracked_stracks = []  # type: list[STrack]
-        for track in self.tracked_stracks:
-            if not track.is_activated:
-                unconfirmed.append(track)
+        for i,strack in enumerate(self.tracked_stracks):
+            strack.predict(w, h)
+            strack.update(self.classifier,self.frame_id,image,self.reid_model)
+            if strack.state == TrackState.Tracked:
+                scores.append(strack.tracklet_score())
+                nms_tlbrs.append(strack.tlbr)
+                index.append(i)
             else:
-                tracked_stracks.append(track)
+                lost_stracks.append(strack)
+        '''step2:un match'''
+        n_tracked = len(scores)
+        det_tlbrs = tlwhs.copy()
+        det_tlbrs[:,2:] += det_tlbrs[:,:2]
+        nms_tlbrs.extend(det_tlbrs)
+        scores.extend(det_scores)
+        scores = np.asarray(scores,dtype=np.float)
+        print('len(det_tlbrs)=',len(det_tlbrs))
+        print('len(scores )=',len(scores))
+        if len(nms_tlbrs)>0:
+            keep = nms_detections(nms_tlbrs,scores,nms_thresh=0.3)
+            tracked_keep = [i for i in keep if (i>=0 and i<n_tracked)]
+            #detect_keep = [i for i in keep if i>=n_tracked]
+            print('index=',index)
+            lost_indexs = []
+            for i in range(n_tracked):
+                if i not in tracked_keep:
+                    lost_indexs.append(index[i])
+            #index = [inde for i in range(n_tracked) if i not in tracked_keep]             #非极大值抑制中淘汰的被跟踪的轨迹索引
+            #print('after_index=',index)
+            for ind in lost_indexs:
+                self.tracked_stracks[ind].mark_removed()
+                removed_stracks.append(self.tracked_stracks[ind])
+            nms_tlbrs_save = [nms_tlbrs[i] for i in keep if i>= n_tracked]
+            nms_tlwhs_save = []
+            for itlbr in nms_tlbrs_save:
+                itlbr[2:] -= itlbr[:2]
+                nms_tlwhs_save.append(itlbr)
+            detect_tracks = [STrack(tlwh) for tlwh in nms_tlwhs_save]
 
-        dists = matching.nearest_reid_distance(tracked_stracks, detections, metric='euclidean')
-        #dists = matching.gate_cost_matrix(self.kalman_filter, dists, tracked_stracks, detections)
-        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.min_ap_dist)
-        for itracked, idet in matches:
-            tracked_stracks[itracked].update(detections[idet], self.frame_id, image)
+            '''step3:update feature'''
+            tracked_tracks = [track for track in self.tracked_stracks if track.state==TrackState.Tracked]
+            over_tlwhs = [track.tlwh for track in itertools.chain(tracked_tracks,detect_tracks)]
+            cut_tlbrs = cutOverLap(over_tlwhs,image)
+            #删除较小的裁剪框
+            cond1 = cut_tlbrs[:,0]+5<cut_tlbrs[:,2]
+            cond2 = cut_tlbrs[:,1]+10<cut_tlbrs[:,3]
+            cut_indexs = np.where([cond1[i] and cond2[i] for i in range(len(cond1))])[0]
+            cut_tlbrs_true = cut_tlbrs[cut_indexs]
+            update_tracks = []
+            for i,update_track in enumerate(itertools.chain(tracked_tracks,detect_tracks)):
+                if i in cut_indexs:
+                    update_tracks.append(update_track)
+                else:
+                    if update_track.curr_feature is None:
+                        update_track.mark_removed()
+                        removed_stracks.append(update_track)
+                    else:
+                        update_track.mark_lost()
+                        lost_stracks.append(update_track)
+            cut_features = extract_reid_features(self.reid_model,image,cut_tlbrs_true)
+            cut_features = cut_features.cpu().numpy()
+            for track,feature in zip(update_tracks,cut_features):
+                track.set_feature(feature)
+        else:
+                detect_tracks = []
+                
+                '''
+                over_image = image.copy()
+                for itlwh in over_tlwhs:
+                    tlwh = list(map(int,itlwh))
+                    x1,y1,w,h = tlwh
+                    x2 = x1+w
+                    y2 = y1+h
+                    cv2.rectangle(over_image,(x1,y1),(x2,y2),(0,255,0),2,8,0)
+                cv2.imshow('over_image ',over_image )
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+                
+                #显示剪切后的图像
+                cut_img = image.copy()
+                for itlbr in cut_tlbrs:
+                    tlbr_ = list(map(int,itlbr))
+                    x1,y1,x2,y2 = tlbr_
+                    if(x1==x2) or (y1==y2):
+                        print('tlbr=',itlbr)
+                    cv2.rectangle(cut_img,tlbr_[:2],tlbr_[2:],(0,255,0),2,8,0)
+                cv2.imshow('cut_img ',cut_img )
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+                '''
+            
+        '''step4:match lost'''
+        #print(len(self.lost_stracks),len(detect_tracks))
+        detect_tracks = [track for track in detect_tracks if track.state==TrackState.New]
+        dists = matching.nearest_reid_distance(self.lost_stracks,detect_tracks,metric='euclidean')
+        matches,u_lost,u_detection = matching.linear_assignment(dists,thresh=self.min_ap_dist)
+        for itracked,idet in matches:
+            self.lost_stracks[itracked].re_activate(detect_tracks[idet],self.frame_id,new_id= not self.use_refind)
+            refind_stracks.append(self.lost_stracks[itracked])
 
-        # matching for missing targets
-        detections = [detections[i] for i in u_detection]
-        dists = matching.nearest_reid_distance(self.lost_stracks, detections, metric='euclidean')
-        #dists = matching.gate_cost_matrix(self.kalman_filter, dists, self.lost_stracks, detections)
-        matches, u_lost, u_detection = matching.linear_assignment(dists, thresh=self.min_ap_dist)
-        for ilost, idet in matches:
-            track = self.lost_stracks[ilost]  # type: STrack
-            det = detections[idet]
-            track.re_activate(det, self.frame_id, image, new_id=not self.use_refind)
-            refind_stracks.append(track)
-
-        # remaining tracked
-        # tracked
-        len_det = len(pred_dets)
-        detections = [detections[i] for i in u_detection] + pred_dets
-        r_tracked_stracks = [tracked_stracks[i] for i in u_track]
-        dists = matching.iou_distance(r_tracked_stracks, detections)
-        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.7)
-        for itracked, idet in matches:
-            r_tracked_stracks[itracked].update(detections[idet], self.frame_id, image, update_feature=True)
-        for it in u_track:
-            track = r_tracked_stracks[it]
-            track.mark_lost()
-            lost_stracks.append(track)
-
-        dists = matching.iou_distance(unconfirmed, detections)
-        matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
-        for itracked, idet in matches:
-            unconfirmed[itracked].update(detections[idet], self.frame_id, image, update_feature=True)
-        for it in u_unconfirmed:
-            track = unconfirmed[it]
-            track.mark_removed()
-            removed_stracks.append(track)
-
-        """step 4: init new stracks"""
+        '''step5:init new stracks'''
         for inew in u_detection:
-            track = detections[inew]
-            if not track.from_det or track.score < 0.6:
-                continue
-            track.activate(self.particle_filter, self.frame_id, image)
+            track = detect_tracks[inew]
+            track.activate(self.particle_filter,self.frame_id)
             activated_starcks.append(track)
-
-        """step 6: update state"""
+        '''step6: update state'''
         for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
+            if self.frame_id-track.end_frame>self.max_time_lost:
                 track.mark_removed()
                 removed_stracks.append(track)
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
-        self.lost_stracks = [t for t in self.lost_stracks if t.state == TrackState.Lost]  # type: list[STrack]
+        self.lost_stracks = [t for t in self.lost_stracks if t.state==TrackState.Lost]
         self.tracked_stracks.extend(activated_starcks)
-        #print('355^^^^^^^^^^^^^^^^^^^^^',len(self.tracked_stracks))
         self.tracked_stracks.extend(refind_stracks)
-        #print('359$$$$$$$$$$$$$$$$$$$$$$$$$$$',len(refind_stracks))
         self.lost_stracks.extend(lost_stracks)
         self.removed_stracks.extend(removed_stracks)
 
-        # output_stracks = self.tracked_stracks + self.lost_stracks
-
         # get scores of lost tracks
-        rois = np.asarray([t.tlbr for t in self.lost_stracks], dtype=np.float32)
+        rois = np.asarray(
+            [t.tlbr for t in self.lost_stracks], dtype=np.float32)
         lost_cls_scores = self.classifier.predict(rois)
         out_lost_stracks = [t for i, t in enumerate(self.lost_stracks)
                             if lost_cls_scores[i] > 0.3 and self.frame_id - t.end_frame <= 4]
-        output_tracked_stracks = [track for track in self.tracked_stracks if track.is_activated]
+        output_tracked_stracks = [
+            track for track in self.tracked_stracks if track.is_activated]
 
         output_stracks = output_tracked_stracks + out_lost_stracks
 
         logger.debug('===========Frame {}=========='.format(self.frame_id))
-        logger.debug('Activated: {}'.format([track.track_id for track in activated_starcks]))
-        logger.debug('Refind: {}'.format([track.track_id for track in refind_stracks]))
-        logger.debug('Lost: {}'.format([track.track_id for track in lost_stracks]))
-        logger.debug('Removed: {}'.format([track.track_id for track in removed_stracks]))
+        logger.debug('Activated: {}'.format(
+            [track.track_id for track in activated_starcks]))
+        logger.debug('Refind: {}'.format(
+            [track.track_id for track in refind_stracks]))
+        logger.debug('Lost: {}'.format(
+            [track.track_id for track in lost_stracks]))
+        logger.debug('Removed: {}'.format(
+            [track.track_id for track in removed_stracks]))
 
         return output_stracks
-'''
-
